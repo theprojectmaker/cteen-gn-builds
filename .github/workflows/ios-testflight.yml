@@ -1,0 +1,101 @@
+# Builds the CTeen GN iPhone app and sends it to TestFlight.
+# The app's code lives in a private repo; this public repo only holds the build
+# recipe, so the Mac build minutes are free. The private repo pushes a new
+# BUILD_SHA here whenever its main branch changes, which starts this workflow.
+#
+# Secrets on this repo:
+#   EXPO_TOKEN         Expo access token (signs the build, uploads to TestFlight)
+#   SOURCE_DEPLOY_KEY  read-only SSH key for the private code repo
+name: iOS build to TestFlight
+
+on:
+  push:
+    branches: [main]
+    paths: [BUILD_SHA]
+  workflow_dispatch:
+    inputs:
+      submit:
+        description: Send the build to TestFlight when it finishes
+        type: boolean
+        default: true
+      ref:
+        description: Commit or branch of the app code to build
+        type: string
+        default: main
+
+concurrency:
+  group: cteen-gn-ios-build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      EAS_SKIP_AUTO_FINGERPRINT: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick the commit to build
+        id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then echo "ref=$(tr -d '[:space:]' < BUILD_SHA)" >> "$GITHUB_OUTPUT"; else echo "ref=${{ inputs.ref }}" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Get the app code
+        uses: actions/checkout@v4
+        with:
+          repository: theprojectmaker/cteen-gn-ios
+          ref: ${{ steps.pick.outputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: app
+          persist-credentials: false
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Type check
+        working-directory: app
+        run: npx tsc --noEmit
+
+      - name: Check every Expo module is from the same SDK
+        working-directory: app
+        run: node scripts/check-sdk.cjs
+
+      - name: Check the token is set
+        working-directory: app
+        run: |
+          if [ -z "$EXPO_TOKEN" ]; then echo "::error::Add the EXPO_TOKEN repository secret first"; exit 1; fi
+          npx --yes eas-cli@latest whoami
+
+      - name: Build the app on this Mac (eas build --local)
+        working-directory: app
+        run: npx --yes eas-cli@latest build --platform ios --profile production --local --non-interactive --output "$RUNNER_TEMP/app.ipa"
+
+      # Only for a manual run without upload (the very first build); normal builds keep nothing here.
+      - name: Keep the .ipa as a download
+        if: ${{ github.event_name != 'push' && !inputs.submit }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: ${{ runner.temp }}/app.ipa
+          retention-days: 1
+
+      - name: Send to TestFlight
+        if: ${{ github.event_name == 'push' || inputs.submit }}
+        working-directory: app
+        run: npx --yes eas-cli@latest submit --platform ios --profile production --path "$RUNNER_TEMP/app.ipa" --non-interactive --wait
