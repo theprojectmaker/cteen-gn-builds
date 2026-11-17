@@ -1,0 +1,77 @@
+# Sends every new commit to phones that already have the app, as an over-the-air
+# (OTA) update, a few minutes after the push. It runs next to the full TestFlight
+# build, not after it. An OTA only reaches builds whose native code matches
+# (runtimeVersion policy "fingerprint"), so a change that needs a new build can
+# never break the app on a phone; that change arrives with the TestFlight build.
+#
+# Secrets on this repo: EXPO_TOKEN, SOURCE_DEPLOY_KEY (same as ios-testflight.yml).
+name: OTA update to phones
+
+on:
+  push:
+    branches: [main]
+    paths: [BUILD_SHA]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit or branch of the app code to publish
+        type: string
+        default: main
+
+# Two pushes close together: the older OTA is cancelled; the newest one already
+# contains both people's changes, because main is one straight line.
+concurrency:
+  group: cteen-gn-ota
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    # Same kind of Mac as the build, so the native fingerprint is worked out the same way.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick the commit to publish
+        id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then echo "ref=$(tr -d '[:space:]' < BUILD_SHA)" >> "$GITHUB_OUTPUT"; else echo "ref=${{ inputs.ref }}" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Get the app code
+        uses: actions/checkout@v4
+        with:
+          repository: theprojectmaker/cteen-gn-ios
+          ref: ${{ steps.pick.outputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: app
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Type check
+        working-directory: app
+        run: npx tsc --noEmit
+
+      - name: Check every Expo module is from the same SDK
+        working-directory: app
+        run: node scripts/check-sdk.cjs
+
+      - name: Publish the update
+        working-directory: app
+        run: |
+          if ! grep -q '"expo-updates"' package.json; then echo "This commit has no expo-updates yet; nothing to publish."; exit 0; fi
+          MSG="$(git log -1 --format='%an: %s' | cut -c1-200)"
+          npx --yes eas-cli@latest update --channel production --environment production --platform ios --message "$MSG" --non-interactive
